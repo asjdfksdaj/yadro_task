@@ -1,51 +1,63 @@
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, field_validator
 
-MAX_NAME_LEN = 255
-name_pattern = r'^[a-zA-Z]+$'
+MAX_NODE_NAME_LENGTH = 255
+node_name_pattern = r'^[a-zA-Z]+$'
 
-class Vertex(BaseModel):
-    name: str = Field(max_length=MAX_NAME_LEN, pattern=name_pattern)
 
-class Link(BaseModel):
-    source: str = Field(max_length=MAX_NAME_LEN, pattern=name_pattern)
-    target: str = Field(max_length=MAX_NAME_LEN, pattern=name_pattern)
+class Node(BaseModel):
+    name: str = Field(max_length=MAX_NODE_NAME_LENGTH,
+                      pattern=node_name_pattern,)
 
-class GraphInput(BaseModel):
-    vertices: list[Vertex]
-    links: list[Link]
 
-    @field_validator('vertices')
-    def check_vertices(cls, v):
-        if not v:
+class Edge(BaseModel):
+    source: str = Field(max_length=MAX_NODE_NAME_LENGTH,
+                        pattern=node_name_pattern,)
+
+    target: str = Field(max_length=MAX_NODE_NAME_LENGTH,
+                        pattern=node_name_pattern,)
+
+
+class GraphCreate(BaseModel):
+    nodes: list[Node]
+    edges: list[Edge]
+
+    @field_validator('nodes')
+    def check_null_nodes(cls, nodes):
+        if len(nodes) == 0:
             raise RequestValidationError(
                 errors=[{
-                    "loc": ["body", "vertices"],
-                    "msg": "Vertices list must not be empty",
+                    "loc": ["body", "nodes"],
+                    "msg": "Nodes list cannot be empty",
                     "type": "value_error"
                 }]
             )
-        return v
+        return nodes
 
-class GraphIdResponse(BaseModel):
+
+class GraphCreateResponse(BaseModel):
     id: int
 
-class GraphDetails(BaseModel):
-    id: int
-    vertices: list[Vertex]
-    links: list[Link]
 
-class AdjacencyResponse(BaseModel):
-    adjacency: dict[str, list[str]]
+class GraphReadResponse(BaseModel):
+    id: int
+    nodes: list[Node]
+    edges: list[Edge]
+
+
+class AdjacencyListResponse(BaseModel):
+    adjacency_list: dict[str, list[str]]
+
 
 class ErrorResponse(BaseModel):
     message: str
 
-class ValidationErrorItem(BaseModel):
+
+class ValidationError(BaseModel):
     loc: list[str]
     msg: str
     type: str
 
-class ValidationErrorResponse(BaseModel):
-    detail: list[ValidationErrorItem] = None
 
+class HTTPValidationError(BaseModel):
+    detail: list[ValidationError] = None
