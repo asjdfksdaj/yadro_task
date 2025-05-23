@@ -1,0 +1,354 @@
+from sqlalchemy import select, exists
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+from sqlalchemy.exc import IntegrityError
+from fastapi import HTTPException
+from .models import Graph, Vertex, Edge
+from .schemas import GraphInput, GraphCreateResponse
+from .schemas import GraphCreate
+ 
+def raise_validation_error(msg: str, loc: list[str] = None):
+    if loc is None:
+        loc = []
+    raise RequestValidationError(errors=[{"loc": loc, "msg": msg, "type": "value_error"}])
+ 
+async def create_graph_in_db(session: AsyncSession, data: GraphInput) -> int:
+    adjacency_map = {}
+    node_states = {}
+    for vert in data.vertices:
+        adjacency_map[vert.name] = []
+        node_states[vert.name] = 0
+ 
+    for link in data.links:
+        if link.source not in adjacency_map:
+            raise_validation_error(f"Вершина {link.source} не найдена", ["body", "links", "source"])
+        if link.target not in adjacency_map:
+            raise_validation_error(f"Вершина {link.target} не найдена", ["body", "links", "target"])
+        adjacency_map[link.source].append(link.target)
+ 
+    # Проверка на цикл (DFS)
+    for node in adjacency_map:
+        if node_states[node] == 0:
+            stack = [node]
+            while stack:
+                current = stack[-1]
+                if node_states[current] != 0:
+                    node_states[current] = 1
+                    stack.pop()
+                    continue
+                else:
+                    node_states[current] = 2
+                for neighbor in adjacency_map[current]:
+                    if node_states[neighbor] == 2:
+                        raise_validation_error("Граф содержит цикл", ["body"])
+                    elif node_states[neighbor] == 0:
+                        stack.append(neighbor)
+ 
+    new_graph = Graph()
+    session.add(new_graph)
+    await session.flush()
+ 
+    vertex_map = {}
+    for vert in data.vertices:
+        v_entity = Vertex(name=vert.name, graph_id=new_graph.id)
+        session.add(v_entity)
+        vertex_map[vert.name] = v_entity
+    await session.flush()
+ 
+    try:
+        for link in data.links:
+            e = Edge(
+                source_id=vertex_map[link.source].id,
+                target_id=vertex_map[link.target].id,
+                graph_id=new_graph.id
+            )
+            session.add(e)
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise_validation_error("Обнаружены дублирующиеся связи", ["body", "links"])
+ 
+    return GraphCreateResponse(id=new_graph.id)
+ 
+async def fetch_graph(session: AsyncSession, graph_id: int):
+    query = select(Graph).options(
+        joinedload(Graph.vertices),
+        joinedload(Graph.edges).joinedload(Edge.source_vertex),
+        joinedload(Graph.edges).joinedload(Edge.target_vertex)
+    ).where(Graph.id == graph_id)
+ 
+    result = await session.execute(query)
+    graph_obj = result.scalar()
+    if not graph_obj:
+        raise HTTPException(status_code=404, detail="Граф не найден")
+    return GraphDetails(
+        id=graph_obj.id,
+        vertices=[Vertex(name=v.name) for v in graph_obj.vertices],
+        links=[
+            Link(source=e.source_vertex.name, target=e.target_vertex.name)
+            for e in graph_obj.edges
+        ]
+    )
+ 
+async def fetch_adj_list(session: AsyncSession, graph_id: int, transpose: bool):
+    graph_info = await fetch_graph(session, graph_id)
+    adj_dict = {}
+    for v in graph_info.vertices:
+        adj_dict[v.name] = []
+ 
+    for e in graph_info.links:
+        if not transpose:
+            adj_dict[e.source].append(e.target)
+        else:
+            adj_dict[e.target].append(e.source)
+    return adj_dict
+ 
+async def delete_vertex(session: AsyncSession, graph_id: int, vertex_name: str):
+    q_vertex = select(Vertex).where(Vertex.graph_id == graph_id, Vertex.name == vertex_name)
+    res = await session.execute(q_vertex)
+    vertex = res.scalar()
+    if not vertex:
+        raise HTTPException(status_code=404, detail="Вершина не найдена")
+    await session.delete(vertex)
+    await session.flush()
+ 
+    remaining = select(exists().where(Vertex.graph_id == graph_id))
+    res_check = await session.execute(remaining)
+    if not res_check.scalar():
+        q_graph = select(Graph).where(Graph.id == graph_id)
+        graph_obj = (await session.execute(q_graph)).scalar()
+        if graph_obj:
+            await session.delete(graph_obj)
+    await session.commit()
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from .settings import DATABASE_URL
+ 
+engine = create_async_engine(DATABASE_URL, echo=True)
+ 
+AsyncSessionLocal = sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+from .db import LocalSession
+from fastapi import Depends
+from typing import Annotated
+from sqlalchemy.ext.asyncio import AsyncSession
+ 
+async def get_session() -> AsyncSession:
+    async with LocalSession() as session:
+        yield session
+ 
+SessionType = Annotated[AsyncSession, Depends(get_session)]
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from contextlib import asynccontextmanager
+from app.models import Base
+from app.db import engine
+from app.routers import router
+ 
+app = FastAPI()
+ 
+@asynccontextmanager
+async def lifespan():
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    yield
+    await engine.dispose()
+ 
+app.include_router(router)
+app.add_event_handler("startup", lifespan)
+app.add_event_handler("shutdown", lifespan)
+ 
+@app.exception_handler(RequestValidationError)
+async def validation_exception(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors()}
+    )
+ 
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail}
+    )
+from sqlalchemy import Column, Integer, String, ForeignKey, UniqueConstraint
+from sqlalchemy.orm import relationship, declarative_base
+ 
+Base = declarative_base()
+ 
+class Vertex(Base):
+    __tablename__ = 'vertices'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), index=True)
+    graph_id = Column(Integer, ForeignKey('graphs.id'))
+    __table_args__ = (UniqueConstraint('name', 'graph_id'),)
+ 
+    incoming_edges = relationship(
+        "Edge",
+        foreign_keys="Edge.target_id",
+        back_populates="target_vertex",
+        cascade="all, delete-orphan"
+    )
+    outgoing_edges = relationship(
+        "Edge",
+        foreign_keys="Edge.source_id",
+        back_populates="source_vertex",
+        cascade="all, delete-orphan"
+    )
+    graph = relationship("Graph", back_populates="vertices")
+ 
+class Edge(Base):
+    __tablename__ = 'edges'
+    id = Column(Integer, primary_key=True)
+    source_id = Column(Integer, ForeignKey('vertices.id'))
+    target_id = Column(Integer, ForeignKey('vertices.id'))
+    graph_id = Column(Integer, ForeignKey('graphs.id'))
+ 
+    source_vertex = relationship("Vertex", foreign_keys=[source_id], back_populates="outgoing_edges")
+    target_vertex = relationship("Vertex", foreign_keys=[target_id], back_populates="incoming_edges")
+    graph = relationship("Graph", back_populates="edges")
+    __table_args__ = (UniqueConstraint('graph_id', 'source_id', 'target_id'),)
+ 
+class Graph(Base):
+    __tablename__ = 'graphs'
+    id = Column(Integer, primary_key=True)
+    vertices = relationship("Vertex", back_populates="graph", cascade="all, delete-orphan")
+    edges = relationship("Edge", back_populates="graph", cascade="all, delete-orphan")
+from fastapi import APIRouter, status
+from .schemas import (
+    GraphDetails, GraphIdResponse, AdjacencyResponse,
+    GraphInput, ErrorResponse, ValidationErrorResponse
+)
+from .crud import (
+    create_graph_in_db, fetch_graph, fetch_adj_list, delete_vertex
+)
+from .deps import Session
+ 
+router = APIRouter(prefix="/api/graph")
+ 
+@router.post(
+    "/",
+    status_code=status.HTTP_201_CREATED,
+    description="Создать граф из списка вершин и связей.",
+    responses={
+        201: {"model": GraphIdResponse, "description": "Граф создан"},
+        400: {"model": ErrorResponse, "description": "Ошибка сохранения"},
+        422: {"model": ValidationErrorResponse, "description": "Ошибка валидации"},
+    }
+)
+async def create_graph_endpoint(db: Session, graph_data: GraphInput):
+    graph_id = await create_graph_in_db(db, graph_data)
+    return {"id": graph_id}
+ 
+@router.get(
+    "/{graph_id}/",
+    description="Получить граф по ID в виде вершин и связей.",
+    responses={
+        200: {"model": GraphDetails, "description": "Данные графа"},
+        404: {"model": ErrorResponse, "description": "Граф не найден"},
+        422: {"model": ValidationErrorResponse, "description": "Ошибка валидации"},
+    }
+)
+async def get_graph_by_id(db: Session, graph_id: int):
+    graph_info = await fetch_graph(db, graph_id)
+    return graph_info
+ 
+@router.get(
+    "/{graph_id}/adjacency_list",
+    description="Получить список смежности графа.",
+    responses={
+        200: {"model": AdjacencyResponse, "description": "Список смежности"},
+        404: {"model": ErrorResponse, "description": "Граф не найден"},
+        422: {"model": ValidationErrorResponse, "description": "Ошибка валидации"},
+    }
+)
+async def get_adj_list(db: Session, graph_id: int):
+    adjacency = await fetch_adj_list(db, graph_id, transpose=False)
+    return {"adjacency": adjacency}
+ 
+@router.get(
+    "/{graph_id}/reverse_adjacency_list",
+    description="Получить транспонированный список смежности.",
+    responses={
+        200: {"model": AdjacencyResponse, "description": "Транспонированный список"},
+        404: {"model": ErrorResponse, "description": "Граф не найден"},
+        422: {"model": ValidationErrorResponse, "description": "Ошибка валидации"},
+    }
+)
+async def get_rev_adj_list(db: Session, graph_id: int):
+    adjacency = await fetch_adj_list(db, graph_id, transpose=True)
+    return {"adjacency": adjacency}
+ 
+@router.delete(
+    "/{graph_id}/node/{vertex_name}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    description="Удалить вершину по имени.",
+    responses={
+        204: {"description": "Успешное удаление"},
+        404: {"model": ErrorResponse, "description": "Граф или вершина не найдены"},
+        422: {"model": ValidationErrorResponse, "description": "Ошибка валидации"},
+    }
+)
+async def remove_vertex(db: Session, graph_id: int, vertex_name: str):
+    await delete_vertex(db, graph_id, vertex_name)
+    return None
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, field_validator
+
+MAX_NAME_LEN = 255
+name_pattern = r'^[a-zA-Z]+$'
+
+class Vertex(BaseModel):
+    name: str = Field(max_length=MAX_NAME_LEN, pattern=name_pattern)
+
+class Link(BaseModel):
+    source: str = Field(max_length=MAX_NAME_LEN, pattern=name_pattern)
+    target: str = Field(max_length=MAX_NAME_LEN, pattern=name_pattern)
+
+class GraphInput(BaseModel):
+    vertices: list[Vertex]
+    links: list[Link]
+
+    @field_validator('vertices')
+    def check_vertices(cls, v):
+        if not v:
+            raise RequestValidationError(
+                errors=[{
+                    "loc": ["body", "vertices"],
+                    "msg": "Vertices list must not be empty",
+                    "type": "value_error"
+                }]
+            )
+        return v
+
+class GraphIdResponse(BaseModel):
+    id: int
+
+class GraphDetails(BaseModel):
+    id: int
+    vertices: list[Vertex]
+    links: list[Link]
+
+class AdjacencyResponse(BaseModel):
+    adjacency: dict[str, list[str]]
+
+class ErrorResponse(BaseModel):
+    message: str
+
+class ValidationErrorItem(BaseModel):
+    loc: list[str]
+    msg: str
+    type: str
+
+class ValidationErrorResponse(BaseModel):
+    detail: list[ValidationErrorItem] = None
+
+import os
+
+# Получение строки подключения к базе данных из переменной окружения
+DATABASE_URL = os.getenv("DATABASE_URL")
+
