@@ -69,6 +69,7 @@ POST /api/graph
 
 Добавляет новый граф в систему.
 
+```json
 {
     "nodes": [
         {"name": "a"},
@@ -80,11 +81,13 @@ POST /api/graph
         {"source": "b", "target": "c"}
     ]
 }
+```
 
 GET /api/graph/{graph_id}
 
 Возвращает граф с указанным идентификатором (список вершин и ребер).
 
+```json
 {
     "nodes": [
         {"name": "a"},
@@ -96,11 +99,12 @@ GET /api/graph/{graph_id}
         {"source": "b", "target": "c"}
     ]
 }
+```
 
 GET /api/graph/{graph_id}/adjacency_list
 
 Отдает представление графа в виде списка смежности.
-
+``` json
 {
     "adjacency_list": {
         "a": ["b"],
@@ -108,11 +112,13 @@ GET /api/graph/{graph_id}/adjacency_list
         "c": []
     }
 }
+```
 
 GET /api/graph/{graph_id}/reverse_adjacency_list
 
 Предоставляет транспонированный список смежности по ID графа.
 
+```json
 {
     "reverse_adjacency_list": {
         "a": [],
@@ -120,6 +126,7 @@ GET /api/graph/{graph_id}/reverse_adjacency_list
         "c": ["b"]
     }
 }
+```
 
 DELETE /api/graph/{graph_id}/node/{node_name}
 
